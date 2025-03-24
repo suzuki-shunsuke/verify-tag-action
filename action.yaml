@@ -1,0 +1,274 @@
+name: Verify Tag
+description: Verify Tag
+author: Shunsuke Suzuki
+branding:
+  icon: git-commit
+  color: blue
+inputs:
+  github_token:
+    description: |
+      GitHub Access Token
+      contents:read
+    default: ${{github.token}}
+    required: false
+  tagger_emails:
+    description: |
+      The email addresses of taggers.
+      If this is empty, the tagger email is not verified.
+    required: false
+  issue_repository:
+    description: |
+      The issue number to comment on.
+    required: false
+  issue_number:
+    description: |
+      The issue number to comment on.
+      If this is empty, the issue comment is not created.
+    required: false
+  slack_incoming_webhook_url:
+    description: |
+      The Slack incoming webhook url to post messages.
+      If this is empty, messages aren't posted.
+    required: false
+  require_verified_tag:
+    description: |
+      Either true or false. If this is true, the tag must be verified.
+    required: false
+    default: "true"
+  allowed_commit_length:
+    description: |
+      The number of commits to check the commit SHA.
+    required: false
+    default: "10"
+  allow_prerelease_out_of_default_branch:
+    description: |
+      Either true or false. If this is true, pre-release tags out of the default branch are allowed.
+    required: false
+    default: "true"
+outputs:
+  annotated_tag:
+    value: ${{steps.verify.outputs.annotated}}
+    description: |
+      true or false. Whether the tag is annotated.
+  tagger_email:
+    value: ${{steps.verify.outputs.email}}
+    description: |
+      true or false. Whether the tagger email is expected.
+  verified_tag:
+    value: ${{steps.verify.outputs.verified}}
+    description: |
+      true or false. Whether the tag is verified.
+  commit_in_default_branch:
+    value: ${{steps.commit.outputs.default_branch}}
+    description: |
+      true or false. Whether the commit is included in the latest $LENGTH commits of the default branch.
+runs:
+  using: composite
+  steps:
+    - id: prerelease
+      shell: bash
+      env:
+        TAG: ${{github.event.workflow_run.head_branch}}
+      run: |
+        if echo "$TAG" | grep -E '^v?[0-9]+(\.[0-9]+)?(\.[0-9])?$'; then
+          echo value=false >> "$GITHUB_OUTPUT"
+        else
+          echo value=true >> "$GITHUB_OUTPUT"
+        fi
+    # Get Tag
+    - id: verify
+      shell: bash
+      env:
+        GH_TOKEN: ${{inputs.github_token}}
+        TAGGER_EMAILS: ${{inputs.tagger_emails}}
+        TAG: ${{github.event.workflow_run.head_branch}}
+        REQUIRE_VERIFIED_TAG: ${{inputs.require_verified_tag}}
+      # .verification.verified
+      # .tagger.email
+      run: |
+        if [ "$REQUIRE_VERIFIED_TAG" != "true" ] && [ -z "$TAGGER_EMAILS" ]; then
+          echo "email=true" >> "$GITHUB_OUTPUT"
+          echo "verified=true" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+        ref_resp=$(gh api \
+          -H "Accept: application/vnd.github+json" \
+          -H "X-GitHub-Api-Version: 2022-11-28" \
+          --jq '"\(.object.type)/\(.object.sha)"' \
+          "/repos/${GITHUB_REPOSITORY}/git/ref/tags/$TAG")
+        tag_type=${ref_resp%/*}
+        sha=${ref_resp#*/}
+        if [ "$tag_type" != tag ]; then
+          echo "::error:: The tag must be an annotated tag"
+          echo "annotated=false" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+        echo "annotated=true" >> "$GITHUB_OUTPUT"
+
+        resp=$(gh api \
+          -H "Accept: application/vnd.github+json" \
+          -H "X-GitHub-Api-Version: 2022-11-28" \
+          -q '"\(.verification.verified)/\(.tagger.email)"' \
+          "/repos/${GITHUB_REPOSITORY}/git/tags/$sha")
+        verified=${resp%/*}
+        email=${resp#*/}
+        if [ "$REQUIRE_VERIFIED_TAG" = true ] && [ "$verified" != "true" ]; then
+          echo "::error:: Tag is not verified"
+          echo "verified=false" >> "$GITHUB_OUTPUT"
+        else
+          echo "verified=true" >> "$GITHUB_OUTPUT"
+        fi
+        if [ -z "$TAGGER_EMAILS" ]; then
+          echo "email=true" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+        if echo "$TAGGER_EMAILS" | grep -xF "$email" ; then
+          echo "email=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "::error:: Tagger is unexpected"
+          echo "email=false" >> "$GITHUB_OUTPUT"
+        fi
+
+    # Get N commits from the default branch and verify the commit SHA
+    - id: commit
+      shell: bash
+      env:
+        GH_TOKEN: ${{inputs.github_token}}
+        SHA: ${{github.event.workflow_run.head_sha}}
+        LENGTH: ${{inputs.allowed_commit_length}}
+        SKIP: ${{steps.prerelease.outputs.value == 'true' && inputs.allow_prerelease_out_of_default_branch == 'true'}}
+      run: |
+        if [ "$SKIP" = true ]; then
+          echo "default_branch=true" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        repo=${GITHUB_REPOSITORY#*/}
+        shas=$(gh api graphql \
+          -F "owner=$GITHUB_REPOSITORY_OWNER" \
+          -F "repo=$repo" \
+          -F "length=$LENGTH" \
+          -q '.data.repository.defaultBranchRef.target.history.edges[].node.oid' \
+          -f query='
+            query($owner: String!, $repo: String!, $length: Int!) {
+              repository(owner: $owner, name: $repo) {
+                defaultBranchRef {
+                  target {
+                    ... on Commit {
+                      history(first: $length) {
+                        edges {
+                          node {
+                            oid
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }')
+        echo "---"
+        echo "SHAS:"
+        echo "$shas"
+        echo "---"      
+        if echo "$shas" | grep -q "$SHA"; then
+          echo "default_branch=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "::error:: The commit isn't included in the latest $LENGTH commits of the default branch"
+          echo "default_branch=false" >> "$GITHUB_OUTPUT"
+        fi
+
+    - id: result
+      shell: bash
+      env:
+        ANNOTATED: ${{steps.verify.outputs.annotated}}
+        EMAIL: ${{steps.verify.outputs.email}}
+        VERIFIED: ${{steps.verify.outputs.verified}}
+        DEFAULT_BRANCH: ${{steps.commit.outputs.default_branch}}
+      run: |
+        if [ "$ANNOTATED" = true ] && [ "$VERIFIED" = true ] && [ "$EMAIL" = true ] && [ "$DEFAULT_BRANCH" = true ]; then
+          echo "value=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "value=false" >> "$GITHUB_OUTPUT"
+        fi
+
+    - if: steps.result.outputs.value != 'true' && inputs.issue_number != ''
+      shell: bash
+      env:
+        GH_TOKEN: ${{github.token}}
+        TAG: ${{github.event.workflow_run.head_branch}}
+        ISSUE_REPO: ${{inputs.issue_repository}}
+        ISSUE_NUMBER: ${{inputs.issue_number}}
+        ANNOTATED: ${{steps.verify.outputs.annotated}}
+        EMAIL: ${{steps.verify.outputs.email}}
+        VERIFIED: ${{steps.verify.outputs.verified}}
+        DEFAULT_BRANCH: ${{steps.commit.outputs.default_branch}}
+        LENGTH: ${{inputs.allowed_commit_length}}
+      run: |
+        tempfile=$(mktemp)
+        echo "repository: [$GITHUB_REPOSITORY]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY)" >> "$tempfile"
+        echo "tag: [$TAG]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/tag/$TAG)" >> "$tempfile"
+        echo "[Workflow Run]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID)" >> "$tempfile"
+        if [ "$ANNOTATED" != true ]; then
+          echo ":x: A tag isn't annotated" >> "$tempfile"
+        else
+          if [ "$EMAIL" != true ]; then
+            echo ":x: Tagger email is not expected" >> "$tempfile"
+          fi
+          if [ "$VERIFIED" != true ]; then
+            echo ":x: Tag is not verified" >> "$tempfile"
+          fi
+        fi
+        if [ "$DEFAULT_BRANCH" == false ]; then
+          echo ":x: The commit isn't included in the latest $LENGTH commits of the default branch" >> "$tempfile"
+        fi
+        gh issue comment "$ISSUE_NUMBER" -R "${ISSUE_REPO:-$GITHUB_REPOSITORY}" -F "$tempfile"
+        rm "$tempfile"
+
+    - if: steps.result.outputs.value != 'true' && inputs.slack_incoming_webhook_url != ''
+      shell: bash
+      id: slack_body
+      env:
+        TAG: ${{github.event.workflow_run.head_branch}}
+        EMAIL: ${{steps.verify.outputs.email}}
+        VERIFIED: ${{steps.verify.outputs.verified}}
+        DEFAULT_BRANCH: ${{steps.commit.outputs.default_branch}}
+        LENGTH: ${{inputs.allowed_commit_length}}
+      # https://api.slack.com/reference/surfaces/formatting
+      run: |
+        tempfile=$(mktemp)
+        echo "repository: <$GITHUB_SERVER_URL/$GITHUB_REPOSITORY|$GITHUB_REPOSITORY>" >> "$tempfile"
+        echo "tag: <$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/tag/$TAG|$TAG>" >> "$tempfile"
+        echo "<$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID|Workflow Run>" >> "$tempfile"
+        if [ "$ANNOTATED" != true ]; then
+          echo ":x: A tag isn't annotated" >> "$tempfile"
+        else
+          if [ "$EMAIL" != true ]; then
+            echo ":x: Tagger email is not expected" >> "$tempfile"
+          fi
+          if [ "$VERIFIED" != true ]; then
+            echo ":x: Tag is not verified" >> "$tempfile"
+          fi
+        fi
+        if [ "$DEFAULT_BRANCH" == false ]; then
+          echo ":x: The commit isn't included in the latest $LENGTH commits of the default branch" >> "$tempfile"
+        fi
+        {
+          echo 'text<<EOF'
+          cat "$tempfile"
+          echo 'EOF'
+        } >> "$GITHUB_OUTPUT" 
+        rm "$tempfile"
+
+    - if: steps.result.outputs.value != 'true' && inputs.slack_incoming_webhook_url != ''
+      uses: slackapi/slack-github-action@v2.0.0
+      with:
+        webhook: ${{ inputs.slack_incoming_webhook_url }}
+        webhook-type: incoming-webhook
+        payload: ${{ toJson(steps.slack_body.outputs) }}
+
+    - if: steps.result.outputs.value != 'true'
+      shell: bash
+      run: |
+        echo "::error:: The validation failed"
+        exit 1
