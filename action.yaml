@@ -5,6 +5,14 @@ branding:
   icon: git-commit
   color: blue
 inputs:
+  tag:
+    description: |
+      Git tag
+    required: true
+  commit_sha:
+    description: |
+      Commit SHA
+    required: true
   github_token:
     description: |
       GitHub Access Token
@@ -68,7 +76,7 @@ runs:
     - id: prerelease
       shell: bash
       env:
-        TAG: ${{github.event.workflow_run.head_branch}}
+        TAG: ${{inputs.tag}}
       run: |
         if echo "$TAG" | grep -E '^v?[0-9]+(\.[0-9]+)?(\.[0-9])?$'; then
           echo value=false >> "$GITHUB_OUTPUT"
@@ -81,7 +89,7 @@ runs:
       env:
         GH_TOKEN: ${{inputs.github_token}}
         TAGGER_EMAILS: ${{inputs.tagger_emails}}
-        TAG: ${{github.event.workflow_run.head_branch}}
+        TAG: ${{inputs.tag}}
         REQUIRE_VERIFIED_TAG: ${{inputs.require_verified_tag}}
       # .verification.verified
       # .tagger.email
@@ -134,7 +142,7 @@ runs:
       shell: bash
       env:
         GH_TOKEN: ${{inputs.github_token}}
-        SHA: ${{github.event.workflow_run.head_sha}}
+        SHA: ${{inputs.commit_sha}}
         LENGTH: ${{inputs.allowed_commit_length}}
         SKIP: ${{steps.prerelease.outputs.value == 'true' && inputs.allow_prerelease_out_of_default_branch == 'true'}}
       run: |
@@ -196,7 +204,7 @@ runs:
       shell: bash
       env:
         GH_TOKEN: ${{github.token}}
-        TAG: ${{github.event.workflow_run.head_branch}}
+        TAG: ${{inputs.tag}}
         ISSUE_REPO: ${{inputs.issue_repository}}
         ISSUE_NUMBER: ${{inputs.issue_number}}
         ANNOTATED: ${{steps.verify.outputs.annotated}}
@@ -229,7 +237,7 @@ runs:
       shell: bash
       id: slack_body
       env:
-        TAG: ${{github.event.workflow_run.head_branch}}
+        TAG: ${{inputs.tag}}
         EMAIL: ${{steps.verify.outputs.email}}
         VERIFIED: ${{steps.verify.outputs.verified}}
         DEFAULT_BRANCH: ${{steps.commit.outputs.default_branch}}
